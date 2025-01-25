@@ -35,9 +35,9 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
     // ========================================= STATE =========================================
 
     /**
-     * @notice Mapping ERC20s to an isSupported bool.
+     * @notice Mapping withdrawERC20s to an isSupported bool.
      */
-    mapping(ERC20 => bool) public isSupported;
+    mapping(ERC20 => bool) public isWithdrawSupported;
 
     /**
      * @notice The deposit nonce used to map to a deposit hash.
@@ -58,6 +58,26 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
     bool public isPaused;
 
     /**
+     * @notice rate limit period, applies to all assets and defaults to 1 day
+     */
+    uint32 public rateLimitPeriod = 1 days;
+
+    /**
+     * @notice contains necessary values for a rate limit. The last time it was updated, the rate limit for this asset
+     * and the deposits counted since last update
+     */
+    struct Cooldown {
+        uint32 lastTimestamp;
+        uint112 rateLimit;
+        uint112 currentDepositCount;
+    }
+
+    /**
+     * @notice Maps asset addresses to the Cooldown struct for rate limits
+     */
+    mapping(address => Cooldown) public rateLimitByAsset;
+
+    /**
      * @dev Maps deposit nonce to keccak256(address receiver, address depositAsset, uint256 depositAmount, uint256
      * shareAmount, uint256 timestamp, uint256 shareLockPeriod).
      */
@@ -74,20 +94,22 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
     error TellerWithMultiAssetSupport__SharesAreLocked();
     error TellerWithMultiAssetSupport__SharesAreUnLocked();
     error TellerWithMultiAssetSupport__BadDepositHash();
-    error TellerWithMultiAssetSupport__AssetNotSupported();
+    error TellerWithMultiAssetSupport__AssetDepositNotSupported();
+    error TellerWithMultiAssetSupport__AssetWithdrawNotSupported();
     error TellerWithMultiAssetSupport__ZeroAssets();
     error TellerWithMultiAssetSupport__MinimumMintNotMet();
     error TellerWithMultiAssetSupport__MinimumAssetsNotMet();
     error TellerWithMultiAssetSupport__PermitFailedAndAllowanceTooLow();
     error TellerWithMultiAssetSupport__ZeroShares();
     error TellerWithMultiAssetSupport__Paused();
+    error TellerWithMultiAssetSupport__InvalidInput();
+    error TellerWithMultiAssetSupport__RateLimit();
 
     //============================== EVENTS ===============================
 
     event Paused();
     event Unpaused();
-    event AssetAdded(address indexed asset);
-    event AssetRemoved(address indexed asset);
+    event AssetConfigured(address indexed asset, uint112 newRateLimit, bool isWithdrawSupported);
     event Deposit(
         uint256 indexed nonce,
         address indexed receiver,
@@ -145,22 +167,36 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
     }
 
     /**
-     * @notice Adds this asset as a deposit asset.
-     * @dev The accountant must also support pricing this asset, else the `deposit` call will revert.
-     * @dev Callable by OWNER_ROLE.
+     * @notice Configures assets deposit caps (0 if not supported) and withdrawable status
+     * @dev All arrays must be the same length
      */
-    function addAsset(ERC20 asset) external requiresAuth {
-        isSupported[asset] = true;
-        emit AssetAdded(address(asset));
-    }
+    function configureAssets(
+        ERC20[] calldata assets,
+        uint112[] calldata rateLimits,
+        bool[] calldata withdrawStatusByAssets
+    )
+        external
+        requiresAuth
+    {
+        uint256 length = assets.length;
+        if (length != withdrawStatusByAssets.length || length != rateLimits.length) {
+            revert TellerWithMultiAssetSupport__InvalidInput();
+        }
 
-    /**
-     * @notice Removes this asset as a deposit asset.
-     * @dev Callable by OWNER_ROLE.
-     */
-    function removeAsset(ERC20 asset) external requiresAuth {
-        isSupported[asset] = false;
-        emit AssetRemoved(address(asset));
+        for (uint256 i; i < length; ++i) {
+            ERC20 asset = assets[i];
+            // ensure 0 addresses and values are not passed in
+            if (address(asset) == address(0)) {
+                revert TellerWithMultiAssetSupport__InvalidInput();
+            }
+            Cooldown storage cooldown = rateLimitByAsset[address(asset)];
+
+            cooldown.lastTimestamp = uint32(block.timestamp);
+            cooldown.rateLimit = rateLimits[i];
+
+            isWithdrawSupported[asset] = withdrawStatusByAssets[i];
+            emit AssetConfigured(address(asset), rateLimits[i], withdrawStatusByAssets[i]);
+        }
     }
 
     /**
@@ -250,7 +286,9 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
         returns (uint256 shares)
     {
         if (isPaused) revert TellerWithMultiAssetSupport__Paused();
-        if (!isSupported[depositAsset]) revert TellerWithMultiAssetSupport__AssetNotSupported();
+        if (rateLimitByAsset[address(depositAsset)].rateLimit == 0) {
+            revert TellerWithMultiAssetSupport__AssetDepositNotSupported();
+        }
 
         shares = _erc20Deposit(depositAsset, depositAmount, minimumMint, msg.sender);
 
@@ -276,7 +314,9 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
         returns (uint256 shares)
     {
         if (isPaused) revert TellerWithMultiAssetSupport__Paused();
-        if (!isSupported[depositAsset]) revert TellerWithMultiAssetSupport__AssetNotSupported();
+        if (rateLimitByAsset[address(depositAsset)].rateLimit == 0) {
+            revert TellerWithMultiAssetSupport__AssetDepositNotSupported();
+        }
 
         // solhint-disable-next-line no-empty-blocks
         try depositAsset.permit(msg.sender, address(vault), depositAmount, deadline, v, r, s) { }
@@ -306,7 +346,9 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
         nonReentrant
         returns (uint256 shares)
     {
-        if (!isSupported[depositAsset]) revert TellerWithMultiAssetSupport__AssetNotSupported();
+        if (rateLimitByAsset[address(depositAsset)].rateLimit == 0) {
+            revert TellerWithMultiAssetSupport__AssetDepositNotSupported();
+        }
 
         shares = _erc20Deposit(depositAsset, depositAmount, minimumMint, to);
         emit BulkDeposit(address(depositAsset), depositAmount);
@@ -326,7 +368,7 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
         requiresAuth
         returns (uint256 assetsOut)
     {
-        if (!isSupported[withdrawAsset]) revert TellerWithMultiAssetSupport__AssetNotSupported();
+        if (!isWithdrawSupported[withdrawAsset]) revert TellerWithMultiAssetSupport__AssetWithdrawNotSupported();
 
         if (shareAmount == 0) revert TellerWithMultiAssetSupport__ZeroShares();
         assetsOut = shareAmount.mulDivDown(accountant.getRateInQuoteSafe(withdrawAsset), ONE_SHARE);
@@ -349,6 +391,10 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
         internal
         returns (uint256 shares)
     {
+        if (rateLimitByAsset[address(depositAsset)].rateLimit == 0) {
+            revert TellerWithMultiAssetSupport__AssetDepositNotSupported();
+        }
+        _checkRateLimit(address(depositAsset), depositAmount);
         if (depositAmount == 0) revert TellerWithMultiAssetSupport__ZeroAssets();
         shares = depositAmount.mulDivDown(ONE_SHARE, accountant.getRateInQuoteSafe(depositAsset));
         if (shares < minimumMint) revert TellerWithMultiAssetSupport__MinimumMintNotMet();
@@ -374,5 +420,20 @@ contract TellerWithMultiAssetSupport is Auth, BeforeTransferHook, ReentrancyGuar
             keccak256(abi.encode(user, depositAsset, depositAmount, shares, block.timestamp, currentShareLockPeriod));
         depositNonce++;
         emit Deposit(nonce, user, address(depositAsset), depositAmount, shares, block.timestamp, currentShareLockPeriod);
+    }
+
+    function _checkRateLimit(address asset, uint256 attemptedDeposit) internal {
+        Cooldown memory cooldown = rateLimitByAsset[asset];
+        Cooldown storage storageCooldown = rateLimitByAsset[asset];
+
+        if (cooldown.lastTimestamp + rateLimitPeriod < block.timestamp) {
+            storageCooldown.currentDepositCount = 0;
+            storageCooldown.lastTimestamp = uint32(block.timestamp);
+        }
+
+        storageCooldown.currentDepositCount += uint112(attemptedDeposit);
+        if (storageCooldown.currentDepositCount > cooldown.rateLimit) {
+            revert TellerWithMultiAssetSupport__RateLimit();
+        }
     }
 }
